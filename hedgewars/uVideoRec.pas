@@ -48,10 +48,10 @@ procedure initModule;
 procedure freeModule;
 
 implementation
-uses uVariables, GLunit, SDLh, SysUtils, uUtils, uSound, uIO, uMisc, uTypes, uDebug;
+uses uVariables, GLunit, SDLh, SysUtils, uUtils, uSound, uChat, uIO, uMisc, uTypes, uDebug;
 
 type TAddFileLogRaw = procedure (s: pchar); cdecl;
-const AvwrapperLibName = 'libavwrapper';
+const AvwrapperLibName = {$IFDEF WIN32_VCPKG}'avwrapper'{$ELSE}'libavwrapper'{$ENDIF};
 
 function AVWrapper_Init(
               AddLog: TAddFileLogRaw;
@@ -289,8 +289,8 @@ begin
     // Videos don't work if /lua command was used, so we forbid them
     if luaCmdUsed then
         begin
-        // TODO: Show message to player
         PlaySound(sndDenied);
+        AddChatString(#0 + shortstring(trmsg[sidVideoRecLuaFail]));
         AddFileLog('Pre-recording prevented; /lua command was used before');
         exit;
         end;

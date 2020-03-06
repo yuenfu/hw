@@ -1250,7 +1250,7 @@ void HWForm::NetNickNotRegistered(const QString & nick)
     noRegMsg.setIcon(QMessageBox::Information);
     noRegMsg.setWindowTitle(QMessageBox::tr("Hedgewars - Nick not registered"));
     noRegMsg.setWindowModality(Qt::WindowModal);
-    noRegMsg.setText(tr("Your nickname is not registered.\nTo prevent someone else from using it,\nplease register it at www.hedgewars.org"));
+    noRegMsg.setText(tr("Your nickname is not registered.\nTo be able to rejoin games in progress and\nprevent someone else from using your nickname,\nplease register it at www.hedgewars.org."));
 
     if (!config->passwordHash().isEmpty())
     {
@@ -2303,7 +2303,6 @@ void HWForm::UpdateCampaignPageProgress(int index)
         ui.pageCampaign->CBCampaign->setItemIcon(c, notFinishedIcon);
 }
 
-// used for --set-everything [screen width] [screen height] [color dept] [volume] [enable music] [enable sounds] [language file] [full screen] [show FPS] [alternate damage] [timer value] [reduced quality]
 QString HWForm::getDemoArguments()
 {
 
@@ -2321,6 +2320,7 @@ QString HWForm::getDemoArguments()
                    + " --fullscreen-height " + QString::number(resolutions.first.height())
                    + " --width " + QString::number(resolutions.second.width())
                    + " --height " + QString::number(resolutions.second.height())
+                   + (config->vid_Maximized() ? " --maximized" : "")
                    + (config->zoom() == 100 ? "" : " --zoom " + QString::number(config->zoom()))
                    + " --volume " + QString::number(config->volume())
                    + (config->isMusicEnabled() ? "" : " --nomusic")

@@ -397,6 +397,12 @@ width: 12px;
 height: 6px;
 border-radius: 3px;
 }
+QSlider::handle::horizontal:hover {
+background-color: yellow;
+}
+QSlider::handle::horizontal:pressed {
+background-color: white;
+}
 QSlider::handle::horizontal:disabled {
 background-color: #a0a0a0;
 }
@@ -559,4 +565,8 @@ padding-top: 6px;
 {
 padding-top: 2px;
 padding-bottom: 2px;
+}
+ToggleButtonWidget
+{
+padding: 0px;
 }

@@ -7,8 +7,7 @@ use crate::handlers::{AccountInfo, Sha1Digest};
 const CHECK_ACCOUNT_EXISTS_QUERY: &str =
     r"SELECT 1 FROM users WHERE users.name = :username LIMIT 1";
 
-const GET_ACCOUNT_QUERY: &str =
-    r"SELECT CASE WHEN users.status = 1 THEN users.pass ELSE '' END,
+const GET_ACCOUNT_QUERY: &str = r"SELECT CASE WHEN users.status = 1 THEN users.pass ELSE '' END,
      (SELECT COUNT(users_roles.rid) FROM users_roles WHERE users.uid = users_roles.uid AND users_roles.rid = 3),
      (SELECT COUNT(users_roles.rid) FROM users_roles WHERE users.uid = users_roles.uid AND users_roles.rid = 13)
      FROM users WHERE users.name = :username";
@@ -87,6 +86,23 @@ impl Database {
         }
     }
 
+    pub fn get_checker_account(
+        &mut self,
+        nick: &str,
+        checker_password: &str,
+    ) -> Result<bool, Error> {
+        if let Some(pool) = &self.pool {
+            if let Some(row) = pool.first_exec(GET_ACCOUNT_QUERY, params! { "username" => nick })? {
+                let (mut password, _, _) = from_row_opt::<(String, i32, i32)>(row)?;
+                Ok(checker_password == password)
+            } else {
+                Ok(false)
+            }
+        } else {
+            Err(DriverError::SetupError.into())
+        }
+    }
+
     pub fn store_stats(&mut self, stats: &ServerStatistics) -> Result<(), Error> {
         if let Some(pool) = &self.pool {
             for mut stmt in pool.prepare(STORE_STATS_QUERY).into_iter() {
@@ -110,7 +126,7 @@ impl Database {
             if let Some(row) =
                 pool.first_exec(GET_REPLAY_NAME_QUERY, params! { "id" => replay_id })?
             {
-                let filename = from_row_opt::<(String)>(row)?;
+                let filename = from_row_opt::<String>(row)?;
                 Ok(Some(filename))
             } else {
                 Ok(None)

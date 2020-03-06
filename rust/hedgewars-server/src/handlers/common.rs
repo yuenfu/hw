@@ -2,8 +2,11 @@ use crate::{
     core::{
         client::HwClient,
         room::HwRoom,
-        server::HwServer,
-        types::{ClientId, GameCfg, RoomId, TeamInfo, Vote, VoteType},
+        server::{
+            EndGameResult, HwRoomControl, HwServer, JoinRoomError, LeaveRoomResult, StartGameError,
+            VoteError, VoteResult,
+        },
+        types::{ClientId, GameCfg, RoomId, TeamInfo, Vote, VoteType, MAX_HEDGEHOGS_PER_TEAM},
     },
     protocol::messages::{
         add_flags, remove_flags, server_chat,
@@ -14,7 +17,10 @@ use crate::{
     utils::to_engine_msg,
 };
 
-use super::Response;
+use super::{
+    actions::{Destination, DestinationGroup},
+    Response,
+};
 
 use crate::core::types::RoomConfig;
 use rand::{self, seq::SliceRandom, thread_rng, Rng};
@@ -35,10 +41,10 @@ pub fn rnd_reply(options: &[String]) -> HwServerMessage {
     }
 }
 
-pub fn join_lobby(server: &mut HwServer, response: &mut Response) {
+pub fn get_lobby_join_data(server: &HwServer, response: &mut Response) {
     let client_id = response.client_id();
 
-    let client = &server.clients[client_id];
+    let client = server.client(client_id);
     let nick = vec![client.nick.clone()];
     let mut flags = vec![];
     if client.is_registered() {
@@ -69,14 +75,13 @@ pub fn join_lobby(server: &mut HwServer, response: &mut Response) {
         ),
     ];
 
-    let server_msg = ServerMessage(server.get_greetings(client_id).to_string());
+    let server_msg = ServerMessage(server.get_greetings(client).to_string());
 
     let rooms_msg = Rooms(
         server
-            .rooms
-            .iter()
-            .filter(|(_, r)| r.protocol_number == client.protocol_number)
-            .flat_map(|(_, r)| r.info(r.master_id.map(|id| &server.clients[id])))
+            .iter_rooms()
+            .filter(|r| r.protocol_number == client.protocol_number)
+            .flat_map(|r| r.info(r.master_id.map(|id| server.client(id))))
             .collect(),
     );
 
@@ -98,166 +103,73 @@ pub fn join_lobby(server: &mut HwServer, response: &mut Response) {
     response.add(rooms_msg.send_self());
 }
 
-pub fn remove_teams(
-    room: &mut HwRoom,
-    team_names: Vec<String>,
-    is_in_game: bool,
+pub fn get_room_join_data<'a, I: Iterator<Item = &'a HwClient> + Clone>(
+    client: &HwClient,
+    room: &HwRoom,
+    room_clients: I,
     response: &mut Response,
 ) {
-    if let Some(ref mut info) = room.game_info {
-        for team_name in &team_names {
-            info.left_teams.push(team_name.clone());
-
-            if is_in_game {
-                let msg = once(b'F').chain(team_name.bytes());
-                response.add(
-                    ForwardEngineMessage(vec![to_engine_msg(msg)])
-                        .send_all()
-                        .in_room(room.id)
-                        .but_self(),
-                );
-
-                info.teams_in_game -= 1;
-
-                let remove_msg = to_engine_msg(once(b'F').chain(team_name.bytes()));
-                if let Some(m) = &info.sync_msg {
-                    info.msg_log.push(m.clone());
-                    info.sync_msg = None
-                }
-                info.msg_log.push(remove_msg.clone());
-
-                response.add(
-                    ForwardEngineMessage(vec![remove_msg])
-                        .send_all()
-                        .in_room(room.id)
-                        .but_self(),
-                );
-            }
-        }
-    }
-
-    for team_name in team_names {
-        room.remove_team(&team_name);
-        response.add(TeamRemove(team_name).send_all().in_room(room.id));
-    }
-}
-
-fn remove_client_from_room(
-    client: &mut HwClient,
-    room: &mut HwRoom,
-    response: &mut Response,
-    msg: &str,
-) {
-    room.players_number -= 1;
-    if room.players_number > 0 || room.is_fixed() {
-        if client.is_ready() && room.ready_players_number > 0 {
-            room.ready_players_number -= 1;
-        }
-
-        let team_names: Vec<_> = room
-            .client_teams(client.id)
-            .map(|t| t.name.clone())
-            .collect();
-        remove_teams(room, team_names, client.is_in_game(), response);
-
-        if room.players_number > 0 {
-            response.add(
-                RoomLeft(client.nick.clone(), msg.to_string())
-                    .send_all()
-                    .in_room(room.id)
-                    .but_self(),
-            );
-        }
-
-        if client.is_master() && !room.is_fixed() {
-            client.set_is_master(false);
-            response.add(
-                ClientFlags(
-                    remove_flags(&[Flags::RoomMaster]),
-                    vec![client.nick.clone()],
-                )
-                .send_all()
-                .in_room(room.id),
-            );
-            room.master_id = None;
-        }
-    }
-
-    client.room_id = None;
-
-    let update_msg = if room.players_number == 0 && !room.is_fixed() {
-        RoomRemove(room.name.clone())
-    } else {
-        RoomUpdated(room.name.clone(), room.info(Some(&client)))
-    };
-    response.add(update_msg.send_all().with_protocol(room.protocol_number));
-
-    response.add(ClientFlags(remove_flags(&[Flags::InRoom]), vec![client.nick.clone()]).send_all());
-}
-
-pub fn change_master(
-    server: &mut HwServer,
-    room_id: RoomId,
-    new_master_id: ClientId,
-    response: &mut Response,
-) {
-    let room = &mut server.rooms[room_id];
-    if let Some(master_id) = room.master_id {
-        server.clients[master_id].set_is_master(false);
-        response.add(
-            ClientFlags(
-                remove_flags(&[Flags::RoomMaster]),
-                vec![server.clients[master_id].nick.clone()],
-            )
-            .send_all()
-            .in_room(room_id),
+    #[inline]
+    fn partition_nicks<'a, I, F>(clients: I, f: F) -> (Vec<String>, Vec<String>)
+    where
+        I: Iterator<Item = &'a HwClient> + Clone,
+        F: Fn(&&'a HwClient) -> bool,
+    {
+        (
+            clients
+                .clone()
+                .filter(|c| f(c))
+                .map(|c| &c.nick)
+                .cloned()
+                .collect(),
+            clients
+                .filter(|c| !f(c))
+                .map(|c| &c.nick)
+                .cloned()
+                .collect(),
         )
     }
 
-    room.master_id = Some(new_master_id);
-    server.clients[new_master_id].set_is_master(true);
-
+    let nick = client.nick.clone();
     response.add(
-        ClientFlags(
-            add_flags(&[Flags::RoomMaster]),
-            vec![server.clients[new_master_id].nick.clone()],
-        )
-        .send_all()
-        .in_room(room_id),
+        RoomJoined(vec![nick.clone()])
+            .send_all()
+            .in_room(room.id)
+            .but_self(),
     );
-}
-
-pub fn enter_room(
-    server: &mut HwServer,
-    client_id: ClientId,
-    room_id: RoomId,
-    response: &mut Response,
-) {
-    let nick = server.clients[client_id].nick.clone();
-    server.move_to_room(client_id, room_id);
-
-    response.add(RoomJoined(vec![nick.clone()]).send_all().in_room(room_id));
-    response.add(ClientFlags(add_flags(&[Flags::InRoom]), vec![nick]).send_all());
-    let nicks = server.collect_nicks(|(_, c)| c.room_id == Some(room_id));
+    response.add(ClientFlags(add_flags(&[Flags::InRoom]), vec![nick.clone()]).send_all());
+    let nicks = room_clients.clone().map(|c| c.nick.clone()).collect();
     response.add(RoomJoined(nicks).send_self());
-
-    get_room_teams(server, room_id, client_id, response);
-
-    let room = &server.rooms[room_id];
-    get_room_config(room, client_id, response);
 
     let mut flag_selectors = [
         (
             Flags::RoomMaster,
-            server.collect_nicks(|(_, c)| c.is_master()),
+            partition_nicks(room_clients.clone(), |c| c.is_master()),
         ),
-        (Flags::Ready, server.collect_nicks(|(_, c)| c.is_ready())),
-        (Flags::InGame, server.collect_nicks(|(_, c)| c.is_in_game())),
+        (
+            Flags::Ready,
+            partition_nicks(room_clients.clone(), |c| c.is_ready()),
+        ),
+        (
+            Flags::InGame,
+            partition_nicks(room_clients.clone(), |c| c.is_in_game()),
+        ),
     ];
 
-    for (flag, nicks) in &mut flag_selectors {
-        response.add(ClientFlags(add_flags(&[*flag]), replace(nicks, vec![])).send_self());
+    for (flag, (set_nicks, cleared_nicks)) in &mut flag_selectors {
+        if !set_nicks.is_empty() {
+            response.add(ClientFlags(add_flags(&[*flag]), replace(set_nicks, vec![])).send_self());
+        }
+
+        if !cleared_nicks.is_empty() {
+            response.add(
+                ClientFlags(remove_flags(&[*flag]), replace(cleared_nicks, vec![])).send_self(),
+            );
+        }
     }
+
+    get_room_teams(room, Destination::ToSelf, response);
+    get_room_config(room, Destination::ToSelf, response);
 
     if !room.greeting.is_empty() {
         response.add(
@@ -268,35 +180,123 @@ pub fn enter_room(
             .send_self(),
         );
     }
+
+    if let Some(info) = &room.game_info {
+        response.add(
+            ClientFlags(add_flags(&[Flags::Ready, Flags::InGame]), vec![nick])
+                .send_all()
+                .in_room(room.id),
+        );
+        response.add(RunGame.send_self());
+
+        response.add(
+            ForwardEngineMessage(
+                once(to_engine_msg("e$spectate 1".bytes()))
+                    .chain(info.msg_log.iter().cloned())
+                    .collect(),
+            )
+            .send_self(),
+        );
+
+        for team in info.client_teams(client.id) {
+            response.add(
+                ForwardEngineMessage(vec![to_engine_msg(once(b'G').chain(team.name.bytes()))])
+                    .send_all()
+                    .in_room(room.id),
+            );
+        }
+
+        if info.is_paused {
+            response.add(ForwardEngineMessage(vec![to_engine_msg(once(b'I'))]).send_self());
+        }
+    }
 }
 
-pub fn exit_room(server: &mut HwServer, client_id: ClientId, response: &mut Response, msg: &str) {
-    let client = &mut server.clients[client_id];
+pub fn get_room_join_error(error: JoinRoomError, response: &mut Response) {
+    use super::strings::*;
+    match error {
+        JoinRoomError::DoesntExist => response.warn(NO_ROOM),
+        JoinRoomError::WrongProtocol => response.warn(INCOMPATIBLE_ROOM_PROTOCOL),
+        JoinRoomError::WrongPassword => {
+            response.add(Notice("WrongPassword".to_string()).send_self())
+        }
+        JoinRoomError::Full => response.warn(ROOM_FULL),
+        JoinRoomError::Restricted => response.warn(ROOM_JOIN_RESTRICTED),
+        JoinRoomError::RegistrationRequired => response.warn(ROOM_REGISTRATION_REQUIRED),
+    }
+}
 
-    if let Some(room_id) = client.room_id {
-        let room = &mut server.rooms[room_id];
+pub fn get_remove_teams_data(
+    room_id: RoomId,
+    was_in_game: bool,
+    removed_teams: Vec<String>,
+    response: &mut Response,
+) {
+    if was_in_game {
+        for team_name in &removed_teams {
+            let remove_msg = to_engine_msg(once(b'F').chain(team_name.bytes()));
 
-        remove_client_from_room(client, room, response, msg);
+            response.add(
+                ForwardEngineMessage(vec![remove_msg])
+                    .send_all()
+                    .in_room(room_id)
+                    .but_self(),
+            );
+        }
+    } else {
+        for team_name in removed_teams {
+            response.add(TeamRemove(team_name).send_all().in_room(room_id));
+        }
+    }
+}
 
-        if !room.is_fixed() {
-            if room.players_number == 0 {
-                server.rooms.remove(room_id);
-            } else if room.master_id == None {
-                let new_master_id = server.room_clients(room_id).next();
-                if let Some(new_master_id) = new_master_id {
-                    let new_master_nick = server.clients[new_master_id].nick.clone();
-                    let room = &mut server.rooms[room_id];
-                    room.master_id = Some(new_master_id);
-                    server.clients[new_master_id].set_is_master(true);
+pub fn get_room_leave_result(
+    server: &HwServer,
+    room: &HwRoom,
+    leave_message: &str,
+    result: LeaveRoomResult,
+    response: &mut Response,
+) {
+    let client = server.client(response.client_id);
+    response.add(ClientFlags(remove_flags(&[Flags::InRoom]), vec![client.nick.clone()]).send_all());
 
-                    if room.protocol_number < 42 {
-                        room.name = new_master_nick.clone();
-                    }
+    match result {
+        LeaveRoomResult::RoomRemoved => {
+            response.add(
+                RoomRemove(room.name.clone())
+                    .send_all()
+                    .with_protocol(room.protocol_number),
+            );
+        }
 
-                    room.set_join_restriction(false);
-                    room.set_team_add_restriction(false);
-                    room.set_unregistered_players_restriction(true);
+        LeaveRoomResult::RoomRemains {
+            is_empty,
+            was_master,
+            new_master,
+            was_in_game,
+            removed_teams,
+        } => {
+            if !is_empty {
+                response.add(
+                    RoomLeft(client.nick.clone(), leave_message.to_string())
+                        .send_all()
+                        .in_room(room.id)
+                        .but_self(),
+                );
+            }
 
+            if was_master {
+                response.add(
+                    ClientFlags(
+                        remove_flags(&[Flags::RoomMaster]),
+                        vec![client.nick.clone()],
+                    )
+                    .send_all()
+                    .in_room(room.id),
+                );
+
+                if let Some(new_master_id) = new_master {
+                    let new_master_nick = server.client(new_master_id).nick.clone();
                     response.add(
                         ClientFlags(add_flags(&[Flags::RoomMaster]), vec![new_master_nick])
                             .send_all()
@@ -304,21 +304,33 @@ pub fn exit_room(server: &mut HwServer, client_id: ClientId, response: &mut Resp
                     );
                 }
             }
+
+            get_remove_teams_data(room.id, was_in_game, removed_teams, response);
+
+            response.add(
+                RoomUpdated(room.name.clone(), room.info(Some(&client)))
+                    .send_all()
+                    .with_protocol(room.protocol_number),
+            );
         }
     }
 }
 
 pub fn remove_client(server: &mut HwServer, response: &mut Response, msg: String) {
     let client_id = response.client_id();
-    let client = &mut server.clients[client_id];
+    let client = server.client(client_id);
     let nick = client.nick.clone();
 
-    exit_room(server, client_id, response, &msg);
+    if let Some(mut room_control) = server.get_room_control(client_id) {
+        let room_id = room_control.room().id;
+        let result = room_control.leave_room();
+        get_room_leave_result(server, server.room(room_id), &msg, result, response);
+    }
 
     server.remove_client(client_id);
 
-    response.add(LobbyLeft(nick, msg.to_string()).send_all());
-    response.add(Bye("User quit: ".to_string() + &msg).send_self());
+    response.add(LobbyLeft(nick, msg.clone()).send_all());
+    response.add(Bye(msg).send_self());
     response.remove_client(client_id);
 }
 
@@ -332,280 +344,288 @@ pub fn get_room_update(
     response.add(update_msg.send_all().with_protocol(room.protocol_number));
 }
 
-pub fn get_room_config_impl(config: &RoomConfig, to_client: ClientId, response: &mut Response) {
-    response.add(ConfigEntry("FULLMAPCONFIG".to_string(), config.to_map_config()).send(to_client));
+pub fn get_room_config_impl(
+    config: &RoomConfig,
+    destination: Destination,
+    response: &mut Response,
+) {
+    response.add(
+        ConfigEntry("FULLMAPCONFIG".to_string(), config.to_map_config())
+            .send_to_destination(destination.clone()),
+    );
     for cfg in config.to_game_config() {
-        response.add(cfg.to_server_msg().send(to_client));
+        response.add(cfg.to_server_msg().send_to_destination(destination.clone()));
     }
 }
 
-pub fn get_room_config(room: &HwRoom, to_client: ClientId, response: &mut Response) {
-    get_room_config_impl(room.active_config(), to_client, response);
+pub fn get_room_config(room: &HwRoom, destination: Destination, response: &mut Response) {
+    get_room_config_impl(room.active_config(), destination, response);
 }
 
-pub fn get_teams<'a, I>(teams: I, to_client: ClientId, response: &mut Response)
+pub fn get_teams<'a, I>(teams: I, destination: Destination, response: &mut Response)
 where
     I: Iterator<Item = &'a TeamInfo>,
 {
     for team in teams {
-        response.add(TeamAdd(team.to_protocol()).send(to_client));
-        response.add(TeamColor(team.name.clone(), team.color).send(to_client));
-        response.add(HedgehogsNumber(team.name.clone(), team.hedgehogs_number).send(to_client));
+        response.add(TeamAdd(team.to_protocol()).send_to_destination(destination.clone()));
+        response
+            .add(TeamColor(team.name.clone(), team.color).send_to_destination(destination.clone()));
+        response.add(
+            HedgehogsNumber(team.name.clone(), team.hedgehogs_number)
+                .send_to_destination(destination.clone()),
+        );
     }
 }
 
-pub fn get_room_teams(
-    server: &HwServer,
-    room_id: RoomId,
-    to_client: ClientId,
-    response: &mut Response,
-) {
-    let room = &server.rooms[room_id];
+pub fn get_room_teams(room: &HwRoom, destination: Destination, response: &mut Response) {
     let current_teams = match room.game_info {
-        Some(ref info) => &info.teams_at_start,
+        Some(ref info) => &info.original_teams,
         None => &room.teams,
     };
 
-    get_teams(current_teams.iter().map(|(_, t)| t), to_client, response);
+    get_teams(current_teams.iter().map(|(_, t)| t), destination, response);
 }
 
 pub fn get_room_flags(
     server: &HwServer,
     room_id: RoomId,
-    to_client: ClientId,
+    destination: Destination,
     response: &mut Response,
 ) {
-    let room = &server.rooms[room_id];
+    let room = server.room(room_id);
     if let Some(id) = room.master_id {
         response.add(
             ClientFlags(
                 add_flags(&[Flags::RoomMaster]),
-                vec![server.clients[id].nick.clone()],
+                vec![server.client(id).nick.clone()],
             )
-            .send(to_client),
+            .send_to_destination(destination.clone()),
         );
     }
-    let nicks: Vec<_> = server
-        .clients
-        .iter()
-        .filter(|(_, c)| c.room_id == Some(room_id) && c.is_ready())
-        .map(|(_, c)| c.nick.clone())
-        .collect();
+    let nicks = server.collect_nicks(|(_, c)| c.room_id == Some(room_id) && c.is_ready());
+
     if !nicks.is_empty() {
-        response.add(ClientFlags(add_flags(&[Flags::Ready]), nicks).send(to_client));
+        response
+            .add(ClientFlags(add_flags(&[Flags::Ready]), nicks).send_to_destination(destination));
     }
 }
 
-pub fn apply_voting_result(
-    server: &mut HwServer,
-    room_id: RoomId,
+pub fn check_vote(
+    server: &HwServer,
+    room: &HwRoom,
+    kind: &VoteType,
     response: &mut Response,
-    kind: VoteType,
-) {
-    match kind {
+) -> bool {
+    let error = match &kind {
         VoteType::Kick(nick) => {
-            if let Some(client) = server.find_client(&nick) {
-                if client.room_id == Some(room_id) {
-                    let id = client.id;
-                    response.add(Kicked.send(id));
-                    exit_room(server, id, response, "kicked");
-                }
+            if server
+                .find_client(&nick)
+                .filter(|c| c.room_id == Some(room.id))
+                .is_some()
+            {
+                None
+            } else {
+                Some("/callvote kick: No such user!".to_string())
             }
         }
-        VoteType::Map(None) => (),
+        VoteType::Map(None) => {
+            let names: Vec<_> = room.saves.keys().cloned().collect();
+            if names.is_empty() {
+                Some("/callvote map: No maps saved in this room!".to_string())
+            } else {
+                Some(format!("Available maps: {}", names.join(", ")))
+            }
+        }
         VoteType::Map(Some(name)) => {
-            if let Some(location) = server.rooms[room_id].load_config(&name) {
-                response.add(
-                    server_chat(location.to_string())
-                        .send_all()
-                        .in_room(room_id),
-                );
-                let room = &server.rooms[room_id];
-                let room_master = if let Some(id) = room.master_id {
-                    Some(&server.clients[id])
-                } else {
-                    None
-                };
-                get_room_update(None, room, room_master, response);
-
-                for (_, client) in server.clients.iter() {
-                    if client.room_id == Some(room_id) {
-                        super::common::get_room_config(&server.rooms[room_id], client.id, response);
-                    }
-                }
+            if room.saves.get(&name[..]).is_some() {
+                None
+            } else {
+                Some("/callvote map: No such map!".to_string())
             }
         }
         VoteType::Pause => {
-            if let Some(ref mut info) = server.rooms[room_id].game_info {
-                info.is_paused = !info.is_paused;
-                response.add(
-                    server_chat("Pause toggled.".to_string())
-                        .send_all()
-                        .in_room(room_id),
-                );
-                response.add(
-                    ForwardEngineMessage(vec![to_engine_msg(once(b'I'))])
-                        .send_all()
-                        .in_room(room_id),
-                );
+            if room.game_info.is_some() {
+                None
+            } else {
+                Some("/callvote pause: No game in progress!".to_string())
             }
         }
-        VoteType::NewSeed => {
-            let seed = thread_rng().gen_range(0, 1_000_000_000).to_string();
-            let cfg = GameCfg::Seed(seed);
-            response.add(cfg.to_server_msg().send_all().in_room(room_id));
-            server.rooms[room_id].set_config(cfg);
-        }
-        VoteType::HedgehogsPerTeam(number) => {
-            let r = &mut server.rooms[room_id];
-            let nicks = r.set_hedgehogs_number(number);
+        VoteType::NewSeed => None,
+        VoteType::HedgehogsPerTeam(number) => match number {
+            1..=MAX_HEDGEHOGS_PER_TEAM => None,
+            _ => Some("/callvote hedgehogs: Specify number from 1 to 8.".to_string()),
+        },
+    };
 
-            response.extend(
-                nicks
-                    .into_iter()
-                    .map(|n| HedgehogsNumber(n, number).send_all().in_room(room_id)),
-            );
+    match error {
+        None => true,
+        Some(msg) => {
+            response.add(server_chat(msg).send_self());
+            false
         }
     }
 }
 
-fn add_vote(room: &mut HwRoom, response: &mut Response, vote: Vote) -> Option<bool> {
-    let client_id = response.client_id;
-    let mut result = None;
-
-    if let Some(ref mut voting) = room.voting {
-        if vote.is_forced || voting.votes.iter().all(|(id, _)| client_id != *id) {
-            response.add(server_chat("Your vote has been counted.".to_string()).send_self());
-            voting.votes.push((client_id, vote.is_pro));
-            let i = voting.votes.iter();
-            let pro = i.clone().filter(|(_, v)| *v).count();
-            let contra = i.filter(|(_, v)| !*v).count();
-            let success_quota = voting.voters.len() / 2 + 1;
-            if vote.is_forced && vote.is_pro || pro >= success_quota {
-                result = Some(true);
-            } else if vote.is_forced && !vote.is_pro || contra > voting.voters.len() - success_quota
-            {
-                result = Some(false);
-            }
-        } else {
-            response.add(server_chat("You already have voted.".to_string()).send_self());
+pub fn get_vote_data(
+    room_id: RoomId,
+    result: &Result<VoteResult, VoteError>,
+    response: &mut Response,
+) {
+    match result {
+        Ok(VoteResult::Submitted) => {
+            response.add(server_chat("Your vote has been counted.".to_string()).send_self())
         }
-    } else {
-        response.add(server_chat("There's no voting going on.".to_string()).send_self());
+        Ok(VoteResult::Succeeded(_)) | Ok(VoteResult::Failed) => response.add(
+            server_chat("Voting closed.".to_string())
+                .send_all()
+                .in_room(room_id),
+        ),
+        Err(VoteError::NoVoting) => {
+            response.add(server_chat("There's no voting going on.".to_string()).send_self())
+        }
+        Err(VoteError::AlreadyVoted) => {
+            response.add(server_chat("You already have voted.".to_string()).send_self())
+        }
     }
-
-    result
 }
 
-pub fn submit_vote(server: &mut HwServer, vote: Vote, response: &mut Response) {
-    let client_id = response.client_id;
-    let client = &server.clients[client_id];
+pub fn handle_vote(
+    mut room_control: HwRoomControl,
+    result: Result<VoteResult, VoteError>,
+    response: &mut super::Response,
+) {
+    let room_id = room_control.room().id;
+    super::common::get_vote_data(room_control.room().id, &result, response);
 
-    if let Some(room_id) = client.room_id {
-        let room = &mut server.rooms[room_id];
+    if let Ok(VoteResult::Succeeded(kind)) = result {
+        match kind {
+            VoteType::Kick(nick) => {
+                if let Some(kicked_client) = room_control.server().find_client(&nick) {
+                    let kicked_id = kicked_client.id;
+                    if let Some(mut room_control) = room_control.change_client(kicked_id) {
+                        response.add(Kicked.send(kicked_id));
+                        let result = room_control.leave_room();
+                        super::common::get_room_leave_result(
+                            room_control.server(),
+                            room_control.room(),
+                            "kicked",
+                            result,
+                            response,
+                        );
+                    }
+                }
+            }
+            VoteType::Map(None) => (),
+            VoteType::Map(Some(name)) => {
+                if let Some(location) = room_control.load_config(&name) {
+                    let msg = server_chat(location.to_string());
+                    let room = room_control.room();
+                    response.add(msg.send_all().in_room(room.id));
 
-        if let Some(res) = add_vote(room, response, vote) {
+                    let room_master = room.master_id.map(|id| room_control.server().client(id));
+
+                    super::common::get_room_update(None, room, room_master, response);
+
+                    let room_destination = Destination::ToAll {
+                        group: DestinationGroup::Room(room.id),
+                        skip_self: false,
+                    };
+                    super::common::get_room_config(room, room_destination, response);
+                }
+            }
+            VoteType::Pause => {
+                if room_control.toggle_pause() {
+                    response.add(
+                        server_chat("Pause toggled.".to_string())
+                            .send_all()
+                            .in_room(room_id),
+                    );
+                    response.add(
+                        ForwardEngineMessage(vec![to_engine_msg(once(b'I'))])
+                            .send_all()
+                            .in_room(room_id),
+                    );
+                }
+            }
+            VoteType::NewSeed => {
+                let seed = thread_rng().gen_range(0, 1_000_000_000).to_string();
+                let cfg = GameCfg::Seed(seed);
+                response.add(cfg.to_server_msg().send_all().in_room(room_id));
+                room_control.set_config(cfg);
+            }
+            VoteType::HedgehogsPerTeam(number) => {
+                let nicks = room_control.set_hedgehogs_number(number);
+                response.extend(
+                    nicks
+                        .into_iter()
+                        .map(|n| HedgehogsNumber(n, number).send_all().in_room(room_id)),
+                );
+            }
+        }
+    }
+}
+
+pub fn get_start_game_data(
+    server: &HwServer,
+    room_id: RoomId,
+    result: Result<Vec<String>, StartGameError>,
+    response: &mut Response,
+) {
+    match result {
+        Ok(room_nicks) => {
+            let room = server.room(room_id);
+            response.add(RunGame.send_all().in_room(room.id));
             response.add(
-                server_chat("Voting closed.".to_string())
+                ClientFlags(add_flags(&[Flags::InGame]), room_nicks)
                     .send_all()
                     .in_room(room.id),
             );
-            let voting = replace(&mut room.voting, None).unwrap();
-            if res {
-                apply_voting_result(server, room_id, response, voting.kind);
-            }
+
+            let room_master = room.master_id.map(|id| server.client(id));
+            get_room_update(None, room, room_master, response);
         }
+        Err(StartGameError::NotEnoughClans) => {
+            response.warn("The game can't be started with less than two clans!")
+        }
+        Err(StartGameError::NotReady) => response.warn("Not all players are ready"),
+        Err(StartGameError::AlreadyInGame) => response.warn("The game is already in progress"),
     }
 }
 
-pub fn start_game(server: &mut HwServer, room_id: RoomId, response: &mut Response) {
-    let (room_clients, room_nicks): (Vec<_>, Vec<_>) = server
-        .clients
-        .iter()
-        .map(|(id, c)| (id, c.nick.clone()))
-        .unzip();
-    let room = &mut server.rooms[room_id];
+pub fn get_end_game_result(
+    server: &HwServer,
+    room_id: RoomId,
+    result: EndGameResult,
+    response: &mut Response,
+) {
+    let room = server.room(room_id);
+    let room_master = room.master_id.map(|id| server.client(id));
 
-    if !room.has_multiple_clans() {
-        response.add(
-            Warning("The game can't be started with less than two clans!".to_string()).send_self(),
-        );
-    } else if room.protocol_number <= 43 && room.players_number != room.ready_players_number {
-        response.add(Warning("Not all players are ready".to_string()).send_self());
-    } else if room.game_info.is_some() {
-        response.add(Warning("The game is already in progress".to_string()).send_self());
-    } else {
-        room.start_round();
-        for id in room_clients {
-            let c = &mut server.clients[id];
-            c.set_is_in_game(true);
-            c.team_indices = room.client_team_indices(c.id);
-        }
-        response.add(RunGame.send_all().in_room(room.id));
-        response.add(
-            ClientFlags(add_flags(&[Flags::InGame]), room_nicks)
-                .send_all()
-                .in_room(room.id),
-        );
-
-        let room_master = if let Some(id) = room.master_id {
-            Some(&server.clients[id])
-        } else {
-            None
-        };
-        get_room_update(None, room, room_master, response);
-    }
-}
-
-pub fn end_game(server: &mut HwServer, room_id: RoomId, response: &mut Response) {
-    let room = &mut server.rooms[room_id];
-    room.ready_players_number = 1;
-    let room_master = if let Some(id) = room.master_id {
-        Some(&server.clients[id])
-    } else {
-        None
-    };
     get_room_update(None, room, room_master, response);
     response.add(RoundFinished.send_all().in_room(room_id));
 
-    if let Some(info) = replace(&mut room.game_info, None) {
-        for (_, client) in server.clients.iter() {
-            if client.room_id == Some(room_id) && client.is_joined_mid_game() {
-                super::common::get_room_config(room, client.id, response);
-                response.extend(
-                    info.left_teams
-                        .iter()
-                        .map(|name| TeamRemove(name.clone()).send(client.id)),
-                );
-            }
-        }
+    response.extend(
+        result
+            .left_teams
+            .iter()
+            .map(|name| TeamRemove(name.clone()).send_all().in_room(room.id)),
+    );
+
+    let midgame_destination = Destination::ToIds(result.joined_mid_game_clients);
+    for (_, team) in &room.teams {
+        response.add(
+            HedgehogsNumber(team.name.clone(), team.hedgehogs_number)
+                .send_to_destination(midgame_destination.clone()),
+        );
     }
+    super::common::get_room_config(room, midgame_destination.clone(), response);
 
-    let nicks: Vec<_> = server
-        .clients
-        .iter_mut()
-        .filter(|(_, c)| c.room_id == Some(room_id))
-        .map(|(_, c)| {
-            c.set_is_ready(c.is_master());
-            c.set_is_joined_mid_game(false);
-            c
-        })
-        .filter_map(|c| {
-            if !c.is_master() {
-                Some(c.nick.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if !nicks.is_empty() {
-        let msg = if room.protocol_number < 38 {
-            LegacyReady(false, nicks)
-        } else {
-            ClientFlags(remove_flags(&[Flags::Ready]), nicks)
-        };
-        response.add(msg.send_all().in_room(room_id));
+    if !result.unreadied_nicks.is_empty() {
+        response.add(
+            ClientFlags(remove_flags(&[Flags::Ready]), result.unreadied_nicks)
+                .send_all()
+                .in_room(room_id),
+        );
     }
 }
 

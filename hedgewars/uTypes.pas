@@ -94,8 +94,8 @@ type
             sprFlakeL, sprSDFlakeL, sprCloudL, sprSDCloudL, sprCreeper, sprHandCreeper, sprMinigun,
             sprSliderInverted, sprFingerBack, sprFingerBackInv, sprTargetPBack, sprTargetPBackInv,
             sprHealthHud, sprHealthPoisonHud, sprVampHud, sprKarmaHud, sprMedicHud, sprMedicPoisonHud,
-            sprHaloHud, sprInvulnHUD, sprAmPiano, sprHandLandGun, sprFirePunch, sprThroughWrap
-            );
+            sprHaloHud, sprInvulnHUD, sprAmPiano, sprHandLandGun, sprFirePunch, sprThroughWrap,
+            sprDynamiteDefused);
 
     // Gears that interact with other Gears and/or Land
     // first row of gears (<gtExplosives) should be avoided when searching a spawn place
@@ -158,7 +158,7 @@ type
             sndLandGun, sndCaseImpact, sndExtraDamage, sndFirePunchHit, sndGrenade, sndThisOneIsMine,
             sndWhatThe, sndSoLong, sndOhDear, sndGonnaGetYou, sndDrat, sndBugger, sndAmazing,
             sndBrilliant, sndExcellent, sndFire, sndWatchThis, sndRunAway, sndRevenge, sndCutItOut,
-            sndLeaveMeAlone, sndOuch, sndHmm, sndKiss, sndFlyAway, sndPlaneWater);
+            sndLeaveMeAlone, sndOuch, sndHmm, sndKiss, sndFlyAway, sndPlaneWater, sndDynamiteFuse);
 
     // Available ammo types to be used by hedgehogs
     TAmmoType  = (amNothing, amGrenade, amClusterBomb, amBazooka, amBee, amShotgun, amPickHammer, // 6
@@ -515,7 +515,8 @@ type
             sidWinner2, sidWinner3, sidWinner4, sidWinner5, sidWinner6,
             sidWinner7, sidWinnerAll, sidTeamGone, sidTeamBack, sidAutoSkip,
             sidFPS, sidLuaParsingOff, sidLuaParsingOn, sidLuaParsingDenied,
-            sidAmmoCount, sidChat, sidChatTeam, sidChatHog, sidUnknownGearValue);
+            sidAmmoCount, sidChat, sidChatTeam, sidChatHog, sidUnknownGearValue,
+            sidVideoRecLuaFail);
 
     TCmdHelpStrId = (
             sidCmdHeaderBasic, sidCmdTogglechat, sidCmdTeam, sidCmdMe,
